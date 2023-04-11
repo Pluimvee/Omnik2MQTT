@@ -1,0 +1,24 @@
+#######################################
+# Syntax Coloring Map For PluimLib
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+Omnik           KEYWORD1
+HomeAutomation  KEYWORD1
+Solarman        KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+ESP8266   	KEYWORD2
+Cache   	KEYWORD2
+Proxy	    KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
