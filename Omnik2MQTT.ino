@@ -10,6 +10,7 @@ DATED_VERSION(0, 1)
 #include <Clock.h>
 #include <Timer.h>
 #include <FlashBuffer.h>
+#include <LED.h>
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 // WiFi credentials
@@ -28,7 +29,7 @@ const char *mqtt_passwd   = MQTT_PASS;
 
 ///////////////////////////////////////////////////////////////////////////////////////
 // omnik sends data each 5 min, 12 packages/hr, 120 packages/day
-// We need a flashbuffer of 256b x 128 = 32k
+// We may need a flashbuffer of 256b x 128 = 32k
 #define OMNIK_CACHE_SIZE    0   
 #define OMNIK_CACHE_FILE    "/Omnik.bin"
 
@@ -40,19 +41,18 @@ HAOmnik       omnik;                          // The Omnik HA device
 HAMqtt        mqtt(mqtt_client, omnik,  HADEVICE_SENSOR_COUNT);  // Home Assistant MTTQ    we are at 14 sensors, so set to 20
 Clock         rtc;                            // A real (software) time clock
 FlashBuffer   cache;                          // caching buffer which stores Omnik packages to be forwarded
+LED           led;                            // 
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 // For remote logging the log include needs to be after the global MQTT definition
-void REMOTE_LOG_WRITE(char *msg) { 
-  int i = strlen(msg);
-  if (i > 0 && msg[i-1] == '\n')   // remove trailing \n
-      msg[i-1] = 0;
-  mqtt.publish("OmnikProxy/log", msg, true); 
-}
-
 #define LOG_REMOTE
 #define LOG_LEVEL 2
 #include <Logging.h>
+
+void LOG_CALLBACK(char *msg) { 
+  LOG_REMOVE_NEWLINE(msg);
+  mqtt.publish("OmnikProxy/log", msg, true); 
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 // MQTT connect
@@ -66,8 +66,9 @@ void mqtt_connect() {
 ////////////////////////////////////////////////////////////////////////////////////////////
 void wifi_connect() 
 { 
-  if (WiFi.isConnected())
+  if (((WiFi.getMode() & WIFI_STA) == WIFI_STA) && WiFi.isConnected())
     return;
+
   DEBUG("Wifi connecting to %s.", sta_ssid);
   WiFi.begin(sta_ssid, sta_password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -117,16 +118,16 @@ bool enable_ap()
 ///////////////////////////////////////////////////////////////////////////////////////
 bool disable_ap() 
 {
-  if (server.status() != 0)   // 0=stop, 1=listening, 2=error
+  int retry=0;
+  while ((server.status() != 0) && (retry++ < 5))   // 0=stop, 1=listening, 2=error
   {
-    DEBUG("Stopping Server\n");
     server.stop();
-    delay(500);
+    delay(200);
   }
   if ((WiFi.getMode() & WIFI_AP) != WIFI_OFF)  // we expect wifi to be in WIFI_STA(1) mode
   {
     INFO("Turning AP mode off\n");
-    if (!WiFi.softAPdisconnect(true))
+    if (!WiFi.softAPdisconnect(true))       // TODO: we sometimes crach here, especially when Omnik just reached out to the server
     {
       ERROR("Failed to stop AP %s\n", ap_ssid);
       return false;
@@ -134,14 +135,6 @@ bool disable_ap()
     delay(500);
   }
   return true;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////
-//
-///////////////////////////////////////////////////////////////////////////////////////
-void sync_rtc() {
-  rtc.ntp_sync();
-  DEBUG("Clock synchronized to %s\n", rtc.now().timestamp().c_str());
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -158,6 +151,7 @@ struct OmnikRecord {
 // it will ensure the AP mode is disabled to be able to reach solarman
 ///////////////////////////////////////////////////////////////////////////////////////
 Timer T_throttle;   // timer used to prevent message bursts
+int omnik_failure = 0;
 
 bool sending_mode(DateTime &now)
 {
@@ -166,16 +160,24 @@ bool sending_mode(DateTime &now)
   
   disable_ap();     // disable server and AP to free network access to solarman
 
-  if (!T_throttle.alarm())  // wait for timer to prevent message bursts
+  if (!T_throttle.passed())  // wait for timer to prevent message bursts
     return true;  
+
+  T_throttle.set(5000);   // set throttle timer to 5 sec
 
   WiFiClient omniksolar;
   if (!omniksolar.connect(proxy_server, proxy_port))
   {
+    T_throttle.set(2000);   // set throttle timer to 2 sec on connect failure
     ERROR("Failed to connect to solarman\n");
+    if (++omnik_failure > 40) {
+      WiFi.disconnect();    // reset wifi on so many sequential failures, we may also use a hard reset
+      wifi_connect();       // However, it may be that solarman is OOO and we should first try to ping google
+      omnik_failure = 0;
+    }
     return false;
   }
-  T_throttle.alarm(5000);   // we are connected, set a new timer for new connection after 5sec
+  omnik_failure = 0;
   OmnikRecord record;
   if (cache.peek(&record) &&
       omniksolar.write(record.message, record.length) == record.length)
@@ -203,7 +205,7 @@ bool receiving_mode(DateTime &now)
   // Wait for a client to connect
   WiFiClient client = server.available();
   if (client == 0) 
-    return true;
+    return false;
 
   INFO("[%s] - Client connected with IP %s\n", 
             now.timestamp(DateTime::TIMESTAMP_TIME).c_str(), 
@@ -227,7 +229,7 @@ bool receiving_mode(DateTime &now)
     return false;
 
   if (cache.isfull())
-    INFO("WARNING: Cache limit reached - its FULL\n");
+    ERROR("BUFFER OVERFLOW - Cache limit reached: oldest record has been overwritten\n");
 
   return true;
 }
@@ -235,27 +237,80 @@ bool receiving_mode(DateTime &now)
 ///////////////////////////////////////////////////////////////////////////////////////
 //
 ///////////////////////////////////////////////////////////////////////////////////////
-DateTime T_reboot;
+DateTime bedtime;
 
+void sync_clock()
+{
+  rtc.ntp_sync();
+  DateTime now = rtc.now();
+  DEBUG("Clock synchronized to %s\n", now.timestamp().c_str());
+
+  // set deepsleep for 1:00 the following day
+  // if its between 0:00 and 0:59 the first 1:00 is skipped
+  bedtime = DateTime(now.year(), now.month(), now.day(), 1, 0, 0) + TimeSpan(1,0,0,0);
+
+  INFO("[%s] - Clock synchronized and Bed time set for %s\n", 
+              now.timestamp(DateTime::TIMESTAMP_TIME).c_str(), 
+              bedtime.timestamp().c_str());
+}
+
+///////////////////////////////////////////////////////////////////////////////////////
+bool deep_sleep(DateTime &now)
+{
+#if (1)   // enable to use reboot
+  INFO("REBOOT in 2 seconds, after which we start fresh....\n");
+  // to flush remote logging to MQTT we handle MQTT
+  mqtt.loop();    
+  // wait 2 seconds
+  delay(2000);  
+  ESP.reset();    // use reset() instead of restart() to include hardware reset (eg WiFi) 
+#endif
+
+#if (0) // enable to use deepsleep
+  // deepsleep requires D0 (GPIO16) to be hard wired with the RST pin. According to some web pages this may cause issues uploading firmware
+  // we need to test if this also applies to OTA. So for now we stick to a Restart instead of Sleep
+
+  INFO("[%s] - Its time to enter Deepsleep, set wakeup time for 5:30 AM\n", now.timestamp(DateTime::TIMESTAMP_TIME).c_str());
+  // disable server and AP 
+  disable_ap();     
+  delay(500);
+  // TODO: instead of 5:30 use sunrise - 30 minutes
+  DateTime wakeup(now.year(), now.month(), now.day(), 5, 30, 0);    // set wakeup for today 5:30, which is correct if ots past 0:00
+  if (wakeup < now)                                                 // if that time has already past than its before 0:00
+    wakeup = wakeup + TimeSpan(1,0,0,0);                            // and we need to wake up the following day
+  int secondsUntilWakeup = wakeup.unixtime() - now.unixtime();      // however the unixtime returned will still be valid
+
+  INFO("We are about to completely turn of the Wifi, so this is the last you here from me\n");
+  INFO("According to my calculations I will wake up in %d seconds.... CU!!\n", secondsUntilWakeup);
+  // to flush remote logging to MQTT we handle MQTT
+  mqtt.loop();    
+  // wait 2 seconds
+  delay(2000);  
+  // SLEEPING........
+  ESP.deepSleep(secondsUntilWakeup * 1e6, RF_DISABLED);
+#endif
+  // default -> Sync clock and reconfigure next sync/reboot/sleep time
+  sync_clock(); 
+  return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////
+// the main method which determines what we will be doing
+///////////////////////////////////////////////////////////////////////////////////////
 enum ProxyMode {
   RECEIVING,
   SENDING,
-  REBOOT
+  SLEEP
 };
 
 int scheduler(DateTime &now)
 {
-  if (T_reboot < now)         // reboot time is in the past, we are initializing
-  {
-    if (!cache.isempty())     // we first flush the complete cache
-      return SENDING;         // 
-    
-    // set reboot for 1AM by start of today + 1 day & 1 hour 
-    T_reboot = DateTime(now.year(), now.month(), now.day()) + TimeSpan(1,1,0,0);
-    INFO("Reboot scheduled for %s\n", T_reboot.timestamp().c_str());
-  }
-  if (now > T_reboot)  // is it time to reboot?
-    return REBOOT;
+  if (now > bedtime)  // its past bedtime
+    return SLEEP;
+
+//  if ((millis() < 60000) && (!cache.isempty())) // we just rebooted and we have data in the cache, flush data for 1 minute (-boottime)
+//    return SENDING;                             // we've seen the rare occasion in which Omnik connected and transmitted data in this first minute 
+                                                // which filled the cache and we immediatly switched into Sending mode, interfering with Omnik transmition
 
   // NOTE: align the following timing variables
   //  * scheduling (30 minutes)
@@ -267,7 +322,7 @@ int scheduler(DateTime &now)
   case 00: 
     if (cache.isempty())            // check if we have data to send
       break;
-    if (T_last_omnik.seconds() < 2) // check if omnik is sending data at this moment
+    if (T_last_omnik.seconds() < 20) // check if omnik is sending data at this moment
       break;
     if ((T_last_omnik.minutes() < 4) || (T_last_omnik.minutes() > 5))  // each 4,5-5,5 seconds we get new data
       return SENDING;               // All safe!! Lets inform solarman of the omnik data we have cached
@@ -279,19 +334,15 @@ int scheduler(DateTime &now)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////
-//
+// Main Setup 
 ///////////////////////////////////////////////////////////////////////////////////////
 void setup() 
 {
   Serial.begin(115200);
-  INFO("\n\nVersion %s\n", VERSION);
+  INFO("\n\nOmnik Inverter Logger Version %s\n", VERSION);
   wifi_connect();
-  sync_rtc();
 
-  INFO("Starting caching library '%s'\n", OMNIK_CACHE_FILE);
-  if (!cache.begin(OMNIK_CACHE_FILE, sizeof(OmnikRecord), OMNIK_CACHE_SIZE))  
-    ERROR("Failed mounting cache\n");
-
+  // start MQTT to enable remote logging asap
   INFO("Connecting to MQTT server %s\n", mqtt_server);
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -299,11 +350,16 @@ void setup()
   mqtt.onConnected(mqtt_connect);      // register function called when newly connected
   mqtt.begin(mqtt_server, mqtt_port, mqtt_user, mqtt_passwd);  // 
 
+  sync_clock(); 
+
+  INFO("Starting caching library '%s'\n", OMNIK_CACHE_FILE);
+  if (!cache.begin(OMNIK_CACHE_FILE, sizeof(OmnikRecord), OMNIK_CACHE_SIZE))  
+    ERROR("Failed mounting cache\n");
+
   INFO("Initialize OTA\n");
-  // start OTA service
   ArduinoOTA.setPort(8266);
   ArduinoOTA.setHostname("Omnik-Logger");
-  ArduinoOTA.setPassword((const char *)"1234");
+  ArduinoOTA.setPassword(OTA_PASS);
 
   ArduinoOTA.onStart([]() {
     INFO("Starting remote software update");
@@ -321,8 +377,10 @@ void setup()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////
-//
+// Main loop
 ///////////////////////////////////////////////////////////////////////////////////////
+Timer blink;
+
 void loop() 
 {
   // ensure we are still connected (STA-mode)
@@ -331,25 +389,27 @@ void loop()
   ArduinoOTA.handle();
   // handle MQTT
   mqtt.loop();
-
-  // now lets deterime what we are going to do
+  // whats the time
   DateTime now = rtc.now();
-
+  // now lets deterime what we are going to do
   switch (scheduler(now))
   {
   case SENDING:
     sending_mode(now);
+    led.on();                         // led on for sending
     break;
-
-  case REBOOT:
-    INFO("REBOOT event triggered - see you in a few seconds\n");
-    delay(1000);
-    ESP.restart();
+  case SLEEP:
+    deep_sleep(now);
     break;
-  
   default:
   case RECEIVING:
     receiving_mode(now);
+    if (T_last_omnik.elapsed() < 2000)  // if omnik transmition blink fast
+      led.blink();      
+    else if (blink.passed()) {
+      led.blink();      
+      blink.set(1500); 
+    }
     break;
   }
 }
