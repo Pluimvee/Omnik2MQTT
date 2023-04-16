@@ -39,8 +39,8 @@ WiFiServer    server(proxy_port);             // the server recieving Omnik mess
 WiFiClient    mqtt_client;                    // the socket to mqtt
 HAOmnik       omnik;                          // The Omnik HA device
 HAMqtt        mqtt(mqtt_client, omnik,  HADEVICE_SENSOR_COUNT);  // Home Assistant MTTQ    we are at 14 sensors, so set to 20
-Clock         rtc;                            // A real (software) time clock
 FlashBuffer   cache;                          // caching buffer which stores Omnik packages to be forwarded
+Clock         rtc;                            // A real (software) time clock
 LED           led;                            // 
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -362,10 +362,12 @@ void setup()
   ArduinoOTA.setPassword(OTA_PASS);
 
   ArduinoOTA.onStart([]() {
-    INFO("Starting remote software update");
+    INFO("[%s] - Starting remote software update",
+          rtc.now().timestamp(DateTime::TIMESTAMP_TIME).c_str());
   });
   ArduinoOTA.onEnd([]() {
-    INFO("Remote software update finished");
+    INFO("[%s] - Remote software update finished",
+          rtc.now().timestamp(DateTime::TIMESTAMP_TIME).c_str());
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
   });
@@ -396,7 +398,7 @@ void loop()
   {
   case SENDING:
     sending_mode(now);
-    led.on();                         // led on for sending
+    led.on();                           // led on for sending
     break;
   case SLEEP:
     deep_sleep(now);
@@ -404,11 +406,11 @@ void loop()
   default:
   case RECEIVING:
     receiving_mode(now);
-    if (T_last_omnik.elapsed() < 2000)  // if omnik transmition blink fast
+    if (T_last_omnik.elapsed() < 2000)  // blink fast on omnik transmitions
       led.blink();      
     else if (blink.passed()) {
       led.blink();      
-      blink.set(1500); 
+      blink.set(1500);                  // blink slow on listening/awaiting
     }
     break;
   }
