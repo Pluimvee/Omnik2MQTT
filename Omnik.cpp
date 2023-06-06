@@ -61,7 +61,8 @@ bool HAOmnik::begin(const byte mac[6], HAMqtt *mqtt)
   mqtt->addDeviceType(&E_total);
   mqtt->addDeviceType(&operating_hrs);
 
-  enableSharedAvailability();
+//  enableSharedAvailability();
+  temperature.setAvailability(false); // cant call disable() as we need need to force availability reporting
   return true;
 }
   
@@ -185,11 +186,16 @@ bool HAOmnik::handle(const byte *msg, int lg)
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 void HAOmnik::enable() {
-    setAvailability(true);
+  if (!temperature.isOnline())      // if the device is offline
+    temperature.setAvailability(true);
 }
+
 ////////////////////////////////////////////////////////////////////////////////////////////
 void HAOmnik::disable() {
-    setAvailability(false);
+  if (temperature.isOnline()) {     // if the device is online
+    temperature.setValue(20.0f);    // reset temp to room temp
+    temperature.setAvailability(false);
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////

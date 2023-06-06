@@ -11,6 +11,9 @@ DATED_VERSION(0, 1)
 #include <Timer.h>
 #include <FlashBuffer.h>
 #include <LED.h>
+#define LOG_REMOTE
+#define LOG_LEVEL 2
+#include <Logging.h>
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 // WiFi credentials
@@ -44,11 +47,7 @@ Clock         rtc;                            // A real (software) time clock
 LED           led;                            // 
 
 ////////////////////////////////////////////////////////////////////////////////////////////
-// For remote logging the log include needs to be after the global MQTT definition
-#define LOG_REMOTE
-#define LOG_LEVEL 2
-#include <Logging.h>
-
+// For remote logging we use MQTT
 void LOG_CALLBACK(char *msg) { 
   LOG_REMOVE_NEWLINE(msg);
   mqtt.publish("OmnikProxy/log", msg, true); 
@@ -163,12 +162,12 @@ bool sending_mode(DateTime &now)
   if (!T_throttle.passed())  // wait for timer to prevent message bursts
     return true;  
 
-  T_throttle.set(5000);   // set throttle timer to 5 sec
+  T_throttle.set(3000);   // set throttle timer to 5 sec
 
   WiFiClient omniksolar;
   if (!omniksolar.connect(proxy_server, proxy_port))
   {
-    T_throttle.set(2000);   // set throttle timer to 2 sec on connect failure
+    T_throttle.set(1000);   // set throttle timer to 2 sec on connect failure
     ERROR("Failed to connect to solarman\n");
     if (++omnik_failure > 40) {
       WiFi.disconnect();    // reset wifi on so many sequential failures, we may also use a hard reset
@@ -187,7 +186,7 @@ bool sending_mode(DateTime &now)
                 DateTime(record.stamp).timestamp().c_str(), 
                 record.length);
     DEBUG_BIN("Message: ", record.message, record.length);
-    cache.pop();  // succesfully send, remove this package from he cache
+    cache.pop();  // succesfully send, remove this package from the cache
   }
   return true;
 }
@@ -211,6 +210,7 @@ bool receiving_mode(DateTime &now)
             now.timestamp(DateTime::TIMESTAMP_TIME).c_str(), 
             client.remoteIP().toString().c_str());
   T_last_omnik.start();
+  omnik.enable();
 
   OmnikRecord record;
   record.stamp = now.unixtime();
@@ -330,6 +330,9 @@ int scheduler(DateTime &now)
   default:
     break;
   }
+  if (T_last_omnik.minutes() > 30)  // we didnt receive anything in the past 30 minutes
+    omnik.disable();
+
   return RECEIVING;         // most of the time we are in receiving mode
 }
 
@@ -349,6 +352,7 @@ void setup()
   omnik.begin(mac, &mqtt);             // 5) make sure the device gets a unique ID (based on mac address)
   mqtt.onConnected(mqtt_connect);      // register function called when newly connected
   mqtt.begin(mqtt_server, mqtt_port, mqtt_user, mqtt_passwd);  // 
+  omnik.disable();
 
   sync_clock(); 
 
