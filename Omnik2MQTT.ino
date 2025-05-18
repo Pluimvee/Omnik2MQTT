@@ -222,7 +222,7 @@ bool receiving_mode(DateTime &now)
 
   DEBUG_BIN("Message: ", record.message, record.length);
 
-  if (!omnik.handle(record.message, record.length)) 
+  if (!omnik.handle(record.message, record.length), WiFi.RSSI()) 
     return false;
   
   if (!cache.push(&record, true)) 

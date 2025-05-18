@@ -23,9 +23,10 @@ DATED_VERSION(0, 1)
 #define CONFIGURE_STAT(var, name, class, unit, icon)  CONFIGURE_CLS(var, name, class, unit, icon); var.setStateClass("total_increasing")
 ////////////////////////////////////////////////////////////////////////////////////////////
 HAOmnik::HAOmnik() 
-: CONSTRUCT(loggerId), CONSTRUCT(inverterId),     
-  CONSTRUCT_P0(power), CONSTRUCT_P1(temperature), CONSTRUCT_P2(E_today),  
-  CONSTRUCT_P1(E_total), CONSTRUCT_P0(operating_hrs)
+: CONSTRUCT(loggerId),  CONSTRUCT(inverterId),     
+  CONSTRUCT_P0(power),  CONSTRUCT_P1(temperature), 
+  CONSTRUCT_P0(signal), CONSTRUCT_P1(ac_frequency), CONSTRUCT_P0(ac_voltage), 
+  CONSTRUCT_P2(E_today),CONSTRUCT_P1(E_total), CONSTRUCT_P0(operating_hrs)
 {
   CONFIGURE_ICON(loggerId,    "logger-id",    "barcode");
   loggerId.hasAttributes();
@@ -34,10 +35,13 @@ HAOmnik::HAOmnik()
 
   CONFIGURE_CLS(temperature,  "temperature",  "temperature",  "°C",   "thermometer");
   CONFIGURE_CLS(power,        "power",        "power",        "W",    "solar-power");
-  
+  // added 8-11-2023
+  CONFIGURE_CLS(signal,       "signal",       "signal_strength","dBm","signal");
+  CONFIGURE_CLS(ac_frequency, "frequency",    "frequency",    "Hz",   "sine-wave");
+  CONFIGURE_CLS(ac_voltage,   "voltage",      "voltage",      "V",    "sine-wave");
+  // totals
   CONFIGURE_STAT(E_today,     "E-today",      "energy",   	  "kWh",  "transmission-tower-import");
   CONFIGURE_STAT(E_total,     "E-total",      "energy",   	  "kWh",  "transmission-tower-import");
-
   CONFIGURE_CLS(operating_hrs, "operating-hours", "duration",  "h",   "clock-outline");
 }
 
@@ -60,6 +64,9 @@ bool HAOmnik::begin(const byte mac[6], HAMqtt *mqtt)
   mqtt->addDeviceType(&E_today);
   mqtt->addDeviceType(&E_total);
   mqtt->addDeviceType(&operating_hrs);
+  mqtt->addDeviceType(&signal);
+  mqtt->addDeviceType(&ac_frequency);
+  mqtt->addDeviceType(&ac_voltage);
 
 //  enableSharedAvailability();
   temperature.setAvailability(false); // cant call disable() as we need need to force availability reporting
@@ -119,7 +126,7 @@ struct OmnikPayload {
 #define ADD_JSON_VAR(var, div, c)    attr += "\"" #var "\": "; attr += ntohs(payl->var) / div; attr+=c
 
 ////////////////////////////////////////////////////////////////////////////////////////////
-bool HAOmnik::handle(const byte *msg, int lg)
+bool HAOmnik::handle(const byte *msg, int lg, int8_t rssi)
 {
   // first we parse the header, and if its a omnik message we publish the loggerid +  msg
   if (lg < sizeof(OmnikHeader)) {  // header is 12 bytes, an empty message is 14
@@ -167,14 +174,17 @@ bool HAOmnik::handle(const byte *msg, int lg)
   E_today.setValue(ntohs(payl->energy_today) / 100.0f);
   E_total.setValue(ntohl(payl->energy_total) / 10.0f);
   operating_hrs.setValue((float) ntohl(payl->operating_hours));
+  ac_frequency.setValue(ntohs(payl->frequency_ac1) / 100.0f);
+  ac_voltage.setValue(ntohs(payl->voltage_ac1) / 10.0f);
+  signal.setValue(rssi);
 
   // and push some other telemetry as attributes to the inverter_id
   attr = "{";
   ADD_JSON_VAR(voltage_pv1, 10.0f, ',');
   ADD_JSON_VAR(current_pv1, 10.0f, ',');
   ADD_JSON_VAR(current_ac1, 10.0f, ',');
-  ADD_JSON_VAR(voltage_ac1, 10.0f, ',');
-  ADD_JSON_VAR(frequency_ac1, 100.0f, '}');
+  ADD_JSON_VAR(voltage_ac1, 10.0f, ',');    // is now also pushed as sensor
+  ADD_JSON_VAR(frequency_ac1, 100.0f, '}'); // is now also pushed as sensor
   inverterId.setAttributes(attr.c_str());
 
   // everything went fine - this time - lets return positive
